@@ -55,6 +55,7 @@ Every zero-knowledge proof is generated **client-side in WebAssembly** (Groth16 
 - [Key Files](#key-files)
 - [Smart Contracts](#smart-contracts)
 - [Deployment](#deployment)
+- [Maintenance](#maintenance)
 - [Hackathon](#hackathon)
 - [License](#license)
 
@@ -66,21 +67,33 @@ Every zero-knowledge proof is generated **client-side in WebAssembly** (Groth16 
 
 ### Prerequisites
 
-- Node.js 20+ and pnpm
+- Node.js 20+ (pinned in [`.nvmrc`](./.nvmrc); `engines.node` in `frontend/package.json`) and pnpm
 - A [Freighter](https://www.freighter.app/) wallet on Stellar Testnet
 - A Chromium-based browser — `SharedArrayBuffer` and OPFS are required by the WASM prover
 
 ### Install & run
 
 ```bash
-git clone https://github.com/ln-tc999/zstellar-main.git
-cd zstellar-main/frontend
+git clone https://github.com/zstellar-labs/zstellar.git
+cd zstellar/frontend
 
 pnpm install
 pnpm dev          # http://localhost:3000
 ```
 
 Routes: the landing page is at `/`, and the app is at `/app`.
+
+### Commands
+
+Every script in `frontend/package.json`, run from `frontend/`:
+
+| Command | Purpose |
+|---|---|
+| `pnpm dev` | Start the dev server (`next dev`) at http://localhost:3000 |
+| `pnpm build` | Production build (`next build`) |
+| `pnpm start` | Serve the production build (`next start`) |
+| `pnpm lint` | Biome check (`biome check`) |
+| `pnpm format` | Biome format and write (`biome format --write`) |
 
 ### Relayer (required for Private Transfer / Withdraw)
 
@@ -97,6 +110,9 @@ NEXT_PUBLIC_STELLAR_RPC_URL=https://soroban-testnet.stellar.org
 NEXT_PUBLIC_STELLAR_HORIZON_URL=https://horizon-testnet.stellar.org
 ```
 
+> The complete variable list — including the server-only `RELAYER_SECRET` — is documented in
+> **[`frontend/.env.example`](frontend/.env.example)**.
+>
 > For production deployment (relayer env vars, keeping the account funded, COOP/COEP, hosting), see **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)**.
 
 ---
@@ -169,20 +185,14 @@ if action == "withdraw":
 
 ## How It Works
 
-**User flow** — `Connect → Shield → Receive / Pay privately → Withdraw to public`
+**User flows** — three actions from one panel: **Shield**, **Private Transfer**, and **Private Withdraw** (see [The Three Flows](#the-three-flows)). Connect Freighter on Testnet, fund it with the in-app faucet if needed, pick a flow, and use the Receive modal to hand out your shielded address for incoming transfers.
 
-1. **Connect** Freighter on Testnet and fund with the in-app faucet if needed.
-2. **Shield** a public asset into the pool (you sign; tokens are pulled in and a note commitment is created).
-3. **Receive** a shielded address from your Receive modal, or **Pay** a contact's shielded address with a Private Transfer.
-4. **Withdraw** any time to a public `G...` address; the relayer submits, so your address never appears.
-5. **Track** every action through the proof stepper and the View-transaction explorer link.
+**Proof flow (browser)** — the `TxModal` stepper (`frontend/src/components/pages/(main)/TxModal.tsx`, `STEPS`) tracks four user-visible steps, each mapped to the stages the engine and the WASM client emit:
 
-**Proof flow (browser)** — `Derive keys → Build circuit inputs → Prove (Groth16) → Prepare Soroban tx`
-
-1. **Derive keys** from a single Freighter signature (cached locally in OPFS).
-2. **Build inputs** from your unspent notes, the target amount, and the recipient.
-3. **Prove** Groth16 over BN254 with Poseidon2, off the main thread in a Web Worker.
-4. **Prepare** the Soroban `transact` invocation with the proof and `ext_data` bound to the proof.
+1. **Preparing keys & membership** (`keys`, `register`, `sync`) — derive the privacy keys from a single Freighter signature and confirm ASP membership.
+2. **Generating ZK proof** (`load_state`, `prove`, `compute`, `witness`) — build the Groth16 proof over BN254 with Poseidon2, off the main thread in a Web Worker.
+3. **Sign in wallet** (`sign_auth`, `sign_tx`) — approve the authorization entry and the transaction in Freighter; skipped when the relayer submits.
+4. **Submitting on-chain** (`submit`, `confirm`) — broadcast the signed envelope and poll Soroban RPC for confirmation.
 
 **On-chain flow**
 
@@ -204,6 +214,16 @@ relayer signs ---------------->|                              |
    <-- tx hash. Shield/Transfer keep funds shielded.          |
    <-- Withdraw sends public XLM to the target address.       |
 ```
+
+### ASP registration (first deposit)
+
+`depositWithAutoRegister` (`frontend/src/engine/index.ts`) registers the user in the ASP membership tree before the first deposit:
+
+1. `ensureAspRegistered` derives the user's ASP leaf (`deriveAspUserLeaf`) and submits `insert_leaf` through `registerAspMembership`, then records the address under `zStellar:asp-registered:<address>` in `localStorage`.
+2. The membership root only reflects the new leaf after the chain closes another ledger, so the engine waits 6 seconds and then retries `shield` up to 15 times, 4 seconds apart, emitting `sync` status between attempts.
+3. This is why the **first** Shield can take up to a minute; later deposits skip registration entirely because the flag short-circuits `ensureAspRegistered`.
+
+`maybeResetStorage` wipes OPFS and every `zStellar:asp-registered:*` flag whenever `CONTRACTS.pool` changes, so a contract redeploy re-runs registration on the next deposit.
 
 ---
 
@@ -302,6 +322,7 @@ Every private action is a proof produced in the browser and verified on-chain by
 | **WebClient Types** | [`frontend/src/engine/types.ts`](./frontend/src/engine/types.ts) | TypeScript interface for the WASM `executeDeposit` / `executeTransfer` / `executeWithdraw` API |
 | **Stellar Config** | [`frontend/src/lib/stellar/config.ts`](./frontend/src/lib/stellar/config.ts) | Testnet RPC, network passphrase, and the deployed contract addresses |
 | **Stellar Client** | [`frontend/src/lib/stellar/client.ts`](./frontend/src/lib/stellar/client.ts) | `rpc.Server`, pool Merkle root reads, XLM balance, Friendbot funding |
+| **RPC Proxy** | [`frontend/src/app/api/rpc/route.ts`](./frontend/src/app/api/rpc/route.ts) | Edge-runtime, retrying proxy to the upstream Soroban RPC; rewrites an outdated `startLedger` to the current deployment ledger |
 | **ASP Register** | [`frontend/src/lib/stellar/register.ts`](./frontend/src/lib/stellar/register.ts) | Builds and submits `insert_leaf` to register the user in the ASP membership tree |
 | **Relayer Route** | [`frontend/src/app/api/relay/route.ts`](./frontend/src/app/api/relay/route.ts) | Server-side: signs the `sender` auth entry and the tx envelope with the relayer `Keypair`, submits to testnet |
 | **Relayer Setup** | [`frontend/scripts/setup-relayer.mjs`](./frontend/scripts/setup-relayer.mjs) | Generates and Friendbot-funds the relayer, writes `RELAYER_SECRET` and `NEXT_PUBLIC_RELAYER_ADDRESS` to `.env.local` |
@@ -312,6 +333,7 @@ Every private action is a proof produced in the browser and verified on-chain by
 
 | API | Endpoint | Purpose |
 |---|---|---|
+| App proxy | `POST /api/rpc` | The browser's Soroban RPC transport: Edge runtime, 25-second retry budget, `startLedger` rewrite; upstream `STELLAR_RPC_UPSTREAM` |
 | Soroban RPC | `simulateTransaction` | Simulate `transact` / `insert_leaf` to build auth and the resource footprint |
 | Soroban RPC | `sendTransaction` | Submit the signed Soroban transaction to testnet |
 | Soroban RPC | `getTransaction` | Poll for `SUCCESS` / `FAILED` confirmation by hash |
@@ -319,7 +341,9 @@ Every private action is a proof produced in the browser and verified on-chain by
 | Horizon | `GET /accounts/{id}` | Read account balances during relayer setup |
 | Freighter | `getAddress`, `signTransaction`, `signAuthEntry` | Wallet connect and signing of the user-submitted deposit |
 
-RPC: `https://soroban-testnet.stellar.org` · Network passphrase: `Test SDF Network ; September 2015`
+RPC host: `https://soroban-testnet.stellar.org` · Network passphrase: `Test SDF Network ; September 2015`
+
+The browser never calls that host directly: `browserRpcUrl()` in `frontend/src/lib/stellar/config.ts` returns `/api/rpc`, so every browser RPC request goes through the Edge proxy in the first row.
 
 ---
 
@@ -329,12 +353,12 @@ RPC: `https://soroban-testnet.stellar.org` · Network passphrase: `Test SDF Netw
 
 | Contract | Address | Description |
 |---|---|---|
-| `Pool` | `CDQRALECG5P3RGPVZPNRCMUD4NYKDJDHZHZYXCVY3URFXDIZMAFVCS7U` | Single `transact` entrypoint; verifies the proof and applies `ext_data` |
-| `Groth16 Verifier` | `CDZCUT2SPJ6O7MMV7PAMWVEEURUIJL4VY7YK6VXMFRH3VJ7F2HEOYOZG` | On-chain Groth16 proof verification over BN254 |
-| `ASP Membership` | `CDD7LJJDO35WCKZK63Q5ADGT76K7DEEL6YHB4DELMLJ4CPTSCALFXE7Q` | Approved-deposit Merkle tree (`insert_leaf`) |
-| `ASP Non-Membership` | `CCZO4PIFRIZ7ZPXM6PLZYLP5POBDWRP245SVA54K542GHFBRI72FMVBB` | Exclusion-set companion contract |
+| `Pool` | `CCQVW6Z3H2G5T4SZXW6MYQQZWNLTRGJCCLHJLVXR6N7M2E3LPVY3CY2N` | Single `transact` entrypoint; verifies the proof and applies `ext_data` |
+| `Groth16 Verifier` | `CDMMDEFM6T44GYK2AFOQF6FMVJPAJYXUJJA3CIPNYRRJPN3M35662S53` | On-chain Groth16 proof verification over BN254 |
+| `ASP Membership` | `CBEVWMLPG5H36VW5OSDI7RATOHANKN2LBLNHHBTUP33ZHLIZRPAK2365` | Approved-deposit Merkle tree (`insert_leaf`) |
+| `ASP Non-Membership` | `CACMAMCL7JNTE5R64P67KXCFBH2QA73JI2UEIWHJUEO4NVBGBBK3G3TC` | Exclusion-set companion contract |
 | `Token (XLM SAC)` | `CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC` | The shielded asset (native XLM via the Stellar Asset Contract) |
-| `Deployer` | `GCWXHHOBERTQBNCQDK7B4LNUZH72CF7BLWP6XUL4KSRYOOCOIISSFBBT` | Account that deployed the pool |
+| `Deployer` | `GBVYJ2OZFBHEV7TNFY45V4VLZVV747RCI42C7FHDZBW2MYU5KLYGYQQO` | Account that deployed the pool |
 
 ### Key functions
 
@@ -370,6 +394,24 @@ There is **no separate backend to deploy** — the relayer is a serverless Route
 4. Keep the COOP/COEP headers from `next.config.ts` active (required for `SharedArrayBuffer` / OPFS).
 
 Full walkthrough and checklist: **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)**.
+A contract redeploy must move five things together — follow **[docs/REDEPLOY.md](docs/REDEPLOY.md)**.
+
+Recent redeploys and their user-visible consequences are recorded in **[CHANGELOG.md](CHANGELOG.md)**.
+
+---
+
+## Maintenance
+
+### Keeping the vendored WASM `deploymentLedger` in sync
+
+`frontend/scripts/patch-wasm-ledger.mjs` rewrites the hardcoded `"deploymentLedger":<ledger>` value inside the vendored engine bundles — `frontend/public/engine/js/web_bg.wasm`, `prover-worker_bg.wasm`, and `storage-worker_bg.wasm`. It reads the latest testnet ledger from Soroban RPC and patches every file to `latest - 1000`, aborting if the byte length would change.
+
+```bash
+cd frontend
+node scripts/patch-wasm-ledger.mjs
+```
+
+The browser's WASM bundle and the `/api/rpc` proxy must agree on where the current deployment starts: a contract redeploy must also set `NEW_DEPLOYMENT_LEDGER` in `frontend/src/app/api/rpc/route.ts` to the ledger patched into the WASM. The ordered procedure for all five update sites is in **[docs/REDEPLOY.md](docs/REDEPLOY.md)**.
 
 ---
 
@@ -388,7 +430,7 @@ Full walkthrough and checklist: **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)**.
 
 zStellar application code is released under the **MIT License**.
 
-zStellar builds on Nethermind's Stellar Private Payments PoC and its circuits, which carry their own licenses. The PoC is research and educational software, unaudited, and **testnet only with no real assets**. zStellar inherits that constraint: do not use it with real funds.
+zStellar builds on Nethermind's Stellar Private Payments PoC and its circuits, which carry their own licenses. The vendored engine binary and its adapted wrapper — `frontend/public/engine/**`, `frontend/src/engine/vendor/**` and the circuits under `frontend/public/circuits/` — remain under the upstream PoC's Apache-2.0 license (`frontend/public/engine/LICENSE.txt`); only the application code written for zStellar is MIT. The PoC is research and educational software, unaudited, and **testnet only with no real assets**. zStellar inherits that constraint: do not use it with real funds.
 
 ---
 
